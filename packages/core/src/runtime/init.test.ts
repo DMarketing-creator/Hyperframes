@@ -2,6 +2,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { initSandboxRuntimeModular, installFlatGsapTransforms } from "./init";
+import {
+  hideTimedClipsUntilFirstPass,
+  revealTimedClipsAfterFirstPass,
+  SKIPPED_CLIP,
+} from "./timedClipHide";
+import { applyAuthoredTiming, STUDIO_PREVIEW_MARK_META } from "../studioPreviewMark";
 import { collectRuntimeTimelinePayload } from "./timeline";
 import { TYPEGPU_PRESENT_HEARTBEAT_MS } from "./adapters/typegpu";
 import { WebAudioTransport } from "./webAudioTransport";
@@ -358,6 +364,154 @@ describe("initSandboxRuntimeModular", () => {
     expect(bus.hasAttribute("data-start")).toBe(false);
     expect(bus.hasAttribute("data-duration")).toBe(false);
     expect(caption.getAttribute("data-start")).toBe("0");
+  });
+
+  describe("visibility of runtime-stamped elements in Studio preview", () => {
+    afterEach(() => vi.restoreAllMocks());
+
+    // A 10 s film: a video clip, an untimed full-frame backdrop the composition's per-frame script
+    // shows only from 6 s to 8 s, and an untimed badge it never touches. Driven by real GSAP.
+    const mountFilm = () => {
+      const raf = createManualRaf();
+      vi.spyOn(performance, "now").mockImplementation(() => raf.now());
+      window.requestAnimationFrame =
+        raf.requestAnimationFrame as typeof window.requestAnimationFrame;
+      window.cancelAnimationFrame = raf.cancelAnimationFrame as typeof window.cancelAnimationFrame;
+      document.body.innerHTML =
+        `<div id="root" data-composition-id="main" data-root="true" data-start="0" data-duration="10" data-width="1080" data-height="1920">` +
+        `<video id="aroll" class="clip" data-start="0" data-duration="10" muted></video>` +
+        `<div id="plate" style="visibility: hidden"></div>` +
+        `<div id="badge"></div>` +
+        `</div>`;
+      const video = document.querySelector("video")!;
+      video.play = vi.fn(() => Promise.resolve());
+      video.pause = vi.fn();
+      video.load = vi.fn();
+      const plate = document.getElementById("plate")!;
+      const tl = gsap.timeline({ paused: true });
+      const frame = { t: 0 };
+      tl.to(frame, {
+        t: 10,
+        duration: 10,
+        ease: "none",
+        modifiers: {
+          t: (value: number) => {
+            plate.style.visibility = value >= 6 && value < 8 ? "visible" : "hidden";
+            return value;
+          },
+        },
+      });
+      window.__timelines = { main: tl as unknown as RuntimeTimelineLike };
+      withStudioIframe(() => initSandboxRuntimeModular());
+      return { raf, plate, badge: document.getElementById("badge")! };
+    };
+
+    it("keeps a stamped backdrop its script hides hidden on every playing tick", () => {
+      const { raf, plate } = mountFilm();
+      expect(plate.getAttribute("data-hf-autostamped")).toBe("1");
+
+      window.__player?.seek(1);
+      window.__player?.play();
+      const seen = new Set<string>();
+      for (let frame = 0; frame < 120; frame++) {
+        raf.step(16);
+        seen.add(plate.style.visibility);
+      }
+
+      expect(window.__player?.getTime()).toBeGreaterThan(2.5);
+      expect(window.__player?.getTime()).toBeLessThan(6);
+      expect([...seen]).toEqual(["hidden"]);
+    });
+
+    it("still shows a stamped element its author never hides", () => {
+      const { raf, badge } = mountFilm();
+      expect(badge.getAttribute("data-hf-autostamped")).toBe("1");
+
+      window.__player?.seek(1);
+      window.__player?.play();
+      for (let frame = 0; frame < 30; frame++) raf.step(16);
+
+      expect(badge.style.visibility).not.toBe("hidden");
+      expect(getComputedStyle(badge).visibility).toBe("visible");
+    });
+
+    it("hides an authored clip inside a hidden authored clip under a stamped wrapper", () => {
+      document.body.innerHTML =
+        `<div data-composition-id="main" data-root="true" data-start="0" data-duration="10" data-width="1080" data-height="1920">` +
+        `<div id="wall"><div id="scene" data-start="0" data-duration="2">` +
+        `<div id="card" data-start="0" data-duration="10"></div></div></div>` +
+        `</div>`;
+      window.__timelines = { main: createMockTimeline(10) };
+      withStudioIframe(() => initSandboxRuntimeModular());
+      const wall = document.getElementById("wall")!;
+      const scene = document.getElementById("scene")!;
+      const card = document.getElementById("card")!;
+      expect(wall.getAttribute("data-hf-autostamped")).toBe("1");
+
+      window.__player?.renderSeek(1);
+      expect([scene.style.visibility, card.style.visibility]).toEqual(["visible", "visible"]);
+
+      window.__player?.renderSeek(5);
+      expect([scene.style.visibility, card.style.visibility]).toEqual(["hidden", "hidden"]);
+    });
+
+    it("hides a stamped element Studio re-times outside its new window", () => {
+      document.body.innerHTML =
+        `<div data-composition-id="main" data-root="true" data-start="0" data-duration="10" data-width="1080" data-height="1920">` +
+        `<div id="title" style="position: absolute"></div>` +
+        `</div>`;
+      window.__timelines = { main: createMockTimeline(10) };
+      withStudioIframe(() => initSandboxRuntimeModular());
+      const title = document.getElementById("title")!;
+      expect(title.getAttribute("data-hf-autostamped")).toBe("1");
+
+      applyAuthoredTiming(title, [
+        ["data-start", "4"],
+        ["data-duration", "2"],
+      ]);
+      (window as Window & { __hfForceTimelineRebind?: () => void }).__hfForceTimelineRebind?.();
+
+      const at = (time: number) => {
+        window.__player?.renderSeek(time);
+        return title.style.visibility;
+      };
+      expect([at(1), at(5), at(8)]).toEqual(["hidden", "visible", "hidden"]);
+    });
+
+    it("times a clip by its window in a render even when its source carries the stamp", () => {
+      document.body.innerHTML =
+        `<div data-composition-id="main" data-root="true" data-start="0" data-duration="10" data-width="1080" data-height="1920">` +
+        `<div id="title" style="position: absolute" data-start="5" data-duration="2" data-hf-autostamped="1"></div>` +
+        `</div>`;
+      window.__timelines = { main: createMockTimeline(10) };
+      initSandboxRuntimeModular();
+      const title = document.getElementById("title")!;
+
+      const at = (time: number) => {
+        window.__player?.renderSeek(time);
+        return title.style.visibility;
+      };
+      expect([at(1), at(6), at(9)]).toEqual(["hidden", "visible", "hidden"]);
+    });
+
+    it("does not hold a paused seek on images in a stamped container its script hides", () => {
+      const mark = Object.assign(document.createElement("meta"), {
+        name: STUDIO_PREVIEW_MARK_META,
+      });
+      document.head.append(mark);
+      try {
+        hideTimedClipsUntilFirstPass();
+        const { plate } = mountFilm();
+        plate.append(Object.assign(document.createElement("img"), { src: "backdrop.png" }));
+
+        expect(plate.matches(SKIPPED_CLIP)).toBe(false);
+        expect(window.__player?.seek(1)).toBeUndefined();
+      } finally {
+        mark.remove();
+        revealTimedClipsAfterFirstPass();
+        document.head.querySelector("style[data-hf-skip-hidden-images]")?.remove();
+      }
+    });
   });
 
   /**
