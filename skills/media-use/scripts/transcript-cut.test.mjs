@@ -47,6 +47,153 @@ function readPcm(filePath) {
   return samples;
 }
 
+// Three kept ranges, none starting or ending on a frame boundary of any rate below.
+const UNALIGNED_KEEP = "0.137-1.913,2.845-4.111,4.9-5.47";
+const UNALIGNED_KEPT_SECONDS = 1.776 + 1.266 + 0.57;
+
+function cutVideo(t, rate, keep = UNALIGNED_KEEP) {
+  const { dir, cleanup } = fixture();
+  t.after(cleanup);
+
+  const source = join(dir, "source.mp4");
+  execFileSync("ffmpeg", [
+    "-y",
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-f",
+    "lavfi",
+    "-i",
+    `testsrc2=size=160x90:rate=${rate}:duration=6`,
+    "-f",
+    "lavfi",
+    "-i",
+    `sine=frequency=440:duration=6:sample_rate=${SAMPLE_RATE}`,
+    "-c:v",
+    "libx264",
+    "-preset",
+    "ultrafast",
+    "-pix_fmt",
+    "yuv420p",
+    "-c:a",
+    "aac",
+    source,
+  ]);
+
+  const transcriptPath = join(dir, "transcript.json");
+  writeFileSync(transcriptPath, JSON.stringify({ words: [{ text: "tone", start: 0, end: 6 }] }));
+
+  const output = join(dir, "out.mp4");
+  const result = run([
+    "--input",
+    source,
+    "--transcript",
+    transcriptPath,
+    "--keep",
+    keep,
+    "--out",
+    output,
+    "--json",
+  ]);
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  return output;
+}
+
+function readVideoTimestamps(filePath) {
+  const probe = JSON.parse(
+    execFileSync(
+      "ffprobe",
+      [
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=time_base:packet=pts",
+        "-of",
+        "json",
+        filePath,
+      ],
+      { encoding: "utf8" },
+    ),
+  );
+  const [tickNum, tickDen] = probe.streams[0].time_base.split("/").map(Number);
+  // Packets come in decode order; B-frames put that out of presentation order.
+  const pts = probe.packets.map((packet) => Number(packet.pts)).sort((a, b) => a - b);
+  return { tickNum, tickDen, pts };
+}
+
+for (const rate of ["30", "30000/1001", "60"]) {
+  test(
+    `puts every frame of a ${rate} fps video cut on the frame grid, with no gaps`,
+    { skip: !HAS_FFMPEG },
+    (t) => {
+      const [rateNum, rateDen = 1] = rate.split("/").map(Number);
+      const { tickNum, tickDen, pts } = readVideoTimestamps(cutVideo(t, rate));
+      assert.ok(pts.length > rateNum / rateDen, "expected several seconds of video");
+
+      // Frame i belongs at exactly i / rate seconds. Compared as integers, so a
+      // timestamp rounded to the millisecond (0.067 for 2/30) cannot pass.
+      const offGrid = pts.filter(
+        (value, index) => value * tickNum * rateNum !== index * rateDen * tickDen,
+      );
+      assert.equal(
+        offGrid.length,
+        0,
+        `${offGrid.length} of ${pts.length} frames are off the ${rate} fps grid (timestamps in units of ${tickNum}/${tickDen} s)`,
+      );
+    },
+  );
+}
+
+test(
+  "keeps the keyframes of a video cut no more than a second apart",
+  { skip: !HAS_FFMPEG },
+  (t) => {
+    // One kept range of almost four seconds, so only the encoder decides where keyframes go.
+    const output = cutVideo(t, "30", "0.137-4.111,4.9-5.47");
+    const probe = JSON.parse(
+      execFileSync(
+        "ffprobe",
+        [
+          "-v",
+          "error",
+          "-select_streams",
+          "v:0",
+          "-show_entries",
+          "packet=pts_time,flags",
+          "-of",
+          "json",
+          output,
+        ],
+        { encoding: "utf8" },
+      ),
+    );
+    const keyframes = probe.packets
+      .filter((packet) => packet.flags.startsWith("K"))
+      .map((packet) => Number(packet.pts_time))
+      .sort((a, b) => a - b);
+    const gaps = keyframes.slice(1).map((time, index) => time - keyframes[index]);
+    const widest = Math.max(...gaps);
+    // A frame of slack: the forced keyframe is the first frame at or after each second.
+    assert.ok(widest < 1.05, `keyframes are up to ${widest.toFixed(3)}s apart`);
+  },
+);
+
+test(
+  "does not pad the audio of a video cut with encoder priming at each splice",
+  { skip: !HAS_FFMPEG },
+  (t) => {
+    const seconds = readPcm(cutVideo(t, "30")).length / SAMPLE_RATE;
+    // The single AAC encode may round the end up by a frame or two (23 ms each).
+    // Encoding every segment separately instead adds about 25 ms per splice on top.
+    assert.ok(
+      Math.abs(seconds - UNALIGNED_KEPT_SECONDS) < 0.05,
+      `audio runs ${seconds.toFixed(3)}s for ${UNALIGNED_KEPT_SECONDS.toFixed(3)}s kept`,
+    );
+  },
+);
+
 test(
   "keeps a spliced tone continuous at every cut, with no raw phase jump or silence gap",
   { skip: !HAS_FFMPEG },

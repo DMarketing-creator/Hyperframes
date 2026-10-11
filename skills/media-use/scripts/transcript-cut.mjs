@@ -98,7 +98,10 @@ function run() {
       // with priming silence (~25-35ms for AAC), which concat then bakes in as a
       // gap at each cut -- a defect distinct from, and surviving, the fades
       // below. PCM has no priming, so audio is encoded exactly once, at concat.
-      const ext = args.copy ? extname(outPath) || ".mp4" : isAudioOnly(outPath) ? ".wav" : ".mkv";
+      // The video container is .mov, not .mkv: ffmpeg writes Matroska
+      // timestamps in whole milliseconds, which moves frames off the source's
+      // frame grid, and the concat copy below carries that into the output.
+      const ext = args.copy ? extname(outPath) || ".mp4" : isAudioOnly(outPath) ? ".wav" : ".mov";
       const out = join(tmpDir, `segment-${String(index).padStart(4, "0")}${ext}`);
       // --copy stays fade-free (stream copy cannot filter). A segment's true
       // start/end (index 0's start, the last segment's end) borders nothing
@@ -191,12 +194,15 @@ function cutSegment(inputPath, segment, outPath, copy, fade) {
   ];
   if (copy) {
     argv.push("-c", "copy", "-avoid_negative_ts", "make_zero");
-  } else if (extname(outPath).toLowerCase() === ".mkv") {
+  } else if (extname(outPath).toLowerCase() === ".mov") {
     // Concat splices raw segment edges together; without a short ramp the
     // waveform steps discontinuously at every boundary and you hear a click.
     if (fade) argv.push("-af", fade);
     // Video intermediate: keep the picture cheap and the audio uncompressed.
     argv.push("-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-c:a", "pcm_s16le");
+    // A keyframe every second. The renderer seeks into this footage, and x264
+    // on its own leaves up to 250 frames between keyframes.
+    argv.push("-force_key_frames", "expr:gte(t,n_forced)");
   } else {
     if (fade) argv.push("-af", fade);
     argv.push("-c:a", "pcm_s16le");
