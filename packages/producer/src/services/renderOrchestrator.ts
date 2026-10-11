@@ -67,6 +67,7 @@ import {
   type ExtractionPhaseBreakdown,
   type VideoFrameFormat,
   closeCaptureSession,
+  frameFileExtension,
   type CaptureOptions,
   type CaptureVideoMetadataHint,
   type SubTimelineWaitMemo,
@@ -202,13 +203,25 @@ import { runProbeStage } from "./render/stages/probeStage.js";
 import { validateRenderDuration } from "./render/planValidation.js";
 import { runExtractVideosStage } from "./render/stages/extractVideosStage.js";
 import { runAudioStage } from "./render/stages/audioStage.js";
-import { inspectDiskCaptureHeadroom, runCaptureStage } from "./render/stages/captureStage.js";
+import {
+  inspectDiskCaptureHeadroom,
+  runCaptureStage,
+  type CaptureStageResult,
+} from "./render/stages/captureStage.js";
 import {
   type CaptureStreamingStageResult,
   runCaptureStreamingStage,
 } from "./render/stages/captureStreamingStage.js";
 import { runCaptureHdrStage } from "./render/stages/captureHdrStage.js";
 import { runEncodeStage } from "./render/stages/encodeStage.js";
+import { FrameCacheSkipError, frameCacheDirFor, isFrameCacheEnabled } from "./render/frameCache.js";
+import {
+  isCaptureSkipEnabled,
+  moveCapturedRun,
+  planCaptureSkip,
+  type CaptureSkipPlan,
+} from "./render/captureSkip.js";
+import type { FrameRun } from "./render/frameDiff.js";
 import { runAssembleStage } from "./render/stages/assembleStage.js";
 import { shouldUseLayeredComposite } from "./hdrCompositor.js";
 import { resolveCaptureImageFormat } from "./render/captureImageFormat.js";
@@ -939,6 +952,10 @@ export function findMissingFrameRanges(
   }
 
   return ranges;
+}
+
+function sumFrameRuns(runs: readonly FrameRun[]): number {
+  return runs.reduce((sum, run) => sum + run.endFrame - run.startFrame, 0);
 }
 
 export function buildMissingFrameRetryBatches(
@@ -4850,30 +4867,97 @@ async function executeRenderPipeline(input: {
         // ── Disk-based capture (original flow) ────────────────────────────
         resetCaptureAttemptProgress(job);
         const captureFrameStart = Date.now();
+        // Frame cache: leave out the frames the cached render can supply
+        // without being captured again (see captureSkip.ts).
+        const frameCacheDir = isFrameCacheEnabled(process.env)
+          ? frameCacheDirFor(join(projectDir, "renders"))
+          : undefined;
+        const frameCacheEncodes =
+          frameCacheDir !== undefined &&
+          !isPngSequence &&
+          !isGif &&
+          !enableChunkedEncode &&
+          job.config.useGpu !== true;
+        let captureSkip: CaptureSkipPlan | undefined;
+        if (frameCacheDir && frameCacheEncodes && isCaptureSkipEnabled(process.env)) {
+          const planned = await planCaptureSkip({
+            session: probeSession,
+            openSession: {
+              serverUrl: activeFileServer.url,
+              outputDir: join(workDir, "capture-skip-planning"),
+              captureOptions: buildCaptureOptions(),
+              cfg:
+                cfg.forceScreenshot === capturePlan.forceScreenshot
+                  ? cfg
+                  : { ...cfg, forceScreenshot: capturePlan.forceScreenshot },
+            },
+            cacheDir: frameCacheDir,
+            totalFrames,
+            fps: job.config.fps,
+            log,
+            signal: executionSignal,
+          });
+          captureSkip = planned.plan;
+          probeSession = planned.session;
+          log.info("[Render] Frame cache capture plan", {
+            framesSkipped: totalFrames - sumFrameRuns(captureSkip.captureRuns),
+            capture: captureSkip.captureRuns.map((run) => `${run.startFrame}-${run.endFrame}`),
+            probedFrames: captureSkip.probedFrames,
+            ...(captureSkip.reason ? { reason: captureSkip.reason } : {}),
+          });
+        }
+        let capturedRunDirs = 0;
+        const runDiskCapture = (diskPlan: SdrDiskCapturePlan, run?: FrameRun, runDir?: string) =>
+          runCaptureStage({
+            fileServer: activeFileServer,
+            workDir,
+            framesDir: runDir ?? framesDir,
+            job,
+            totalFrames: run ? run.endFrame - run.startFrame : totalFrames,
+            cfg,
+            plan: diskPlan,
+            log,
+            probeSession,
+            captureAttempts,
+            dedupPerfs,
+            buildCaptureOptions,
+            createRenderVideoFrameInjector,
+            abortSignal: executionSignal,
+            assertNotAborted,
+            onProgress,
+            frameRange: run,
+          });
+        // Each run is captured into a directory of its own, numbered from 0 as
+        // the capture stage does for any frame range, then moved into place.
+        const captureFrameRuns = async (
+          diskPlan: SdrDiskCapturePlan,
+          runs: readonly FrameRun[],
+        ): Promise<CaptureStageResult> => {
+          let result: CaptureStageResult = {
+            workerCount: diskPlan.workerCount,
+            probeSession,
+            lastBrowserConsole,
+          };
+          for (const run of runs) {
+            const runDir = join(workDir, `captured-run-${capturedRunDirs++}`);
+            mkdirSync(runDir, { recursive: true });
+            result = await runDiskCapture(diskPlan, run, runDir);
+            // The stage closed or consumed the probe session.
+            probeSession = result.probeSession;
+            moveCapturedRun(runDir, framesDir, run, frameFileExtension(captureOptions.format));
+            rmSync(runDir, { recursive: true, force: true });
+          }
+          return result;
+        };
         const invokeDiskCapture = (diskPlan: SdrDiskCapturePlan) =>
           observeRenderStage(
             observability,
             "capture_disk",
             captureStageObservationData({ needsAlpha: diskPlan.needsAlpha }),
             () =>
-              runCaptureStage({
-                fileServer: activeFileServer,
-                workDir,
-                framesDir,
-                job,
-                totalFrames,
-                cfg,
-                plan: diskPlan,
-                log,
-                probeSession,
-                captureAttempts,
-                dedupPerfs,
-                buildCaptureOptions,
-                createRenderVideoFrameInjector,
-                abortSignal: executionSignal,
-                assertNotAborted,
-                onProgress,
-              }),
+              captureSkip && captureSkip.skippedRuns.length > 0
+                ? captureFrameRuns(diskPlan, captureSkip.captureRuns)
+                : runDiskCapture(diskPlan),
           );
         let captureRes;
         try {
@@ -4959,44 +5043,73 @@ async function executeRenderPipeline(input: {
         perfStages.captureFrameMs = captureFrameMs;
         perfStages.captureSetupMs = Math.max(0, perfStages.captureMs - captureFrameMs);
 
-        const encodeRes = await observeRenderStage(
-          observability,
-          "encode",
-          captureStageObservationData({
-            hasAudio,
-            isPngSequence,
-            isGif,
-            chunkedEncode: enableChunkedEncode,
-          }),
-          () =>
-            runEncodeStage({
-              job,
-              log,
-              outputPath: stagedOutputPath,
-              framesDir,
-              videoOnlyPath,
-              width,
-              height,
-              needsAlpha,
-              captureImageFormat: captureOptions.format ?? "jpeg",
+        const encodeDiskFrames = (
+          skip: Pick<CaptureSkipPlan, "skippedRuns" | "clips"> | undefined,
+        ) =>
+          observeRenderStage(
+            observability,
+            "encode",
+            captureStageObservationData({
               hasAudio,
-              audioOutputPath,
               isPngSequence,
               isGif,
-              preset,
-              effectiveQuality,
-              effectiveBitrate,
-              enableChunkedEncode,
-              chunkedEncodeSize,
-              engineConfig: cfg,
-              // Same value the streaming encoder above spreads — the disk and
-              // chunked-concat encoders need an identical GOP lock for HLS.
-              ...hlsEncoderGopLock,
-              abortSignal: executionSignal,
-              assertNotAborted,
-              onProgress,
+              chunkedEncode: enableChunkedEncode,
             }),
-        );
+            () =>
+              runEncodeStage({
+                job,
+                log,
+                outputPath: stagedOutputPath,
+                framesDir,
+                videoOnlyPath,
+                width,
+                height,
+                needsAlpha,
+                captureImageFormat: captureOptions.format ?? "jpeg",
+                hasAudio,
+                audioOutputPath,
+                isPngSequence,
+                isGif,
+                preset,
+                effectiveQuality,
+                effectiveBitrate,
+                enableChunkedEncode,
+                chunkedEncodeSize,
+                engineConfig: cfg,
+                // Same value the streaming encoder above spreads — the disk and
+                // chunked-concat encoders need an identical GOP lock for HLS.
+                ...hlsEncoderGopLock,
+                frameCacheDir,
+                captureSkip: skip,
+                abortSignal: executionSignal,
+                assertNotAborted,
+                onProgress,
+              }),
+          );
+        let encodeRes;
+        try {
+          encodeRes = await encodeDiskFrames(captureSkip);
+        } catch (err) {
+          if (
+            !(err instanceof FrameCacheSkipError) ||
+            !captureSkip ||
+            captureSkip.skippedRuns.length === 0 ||
+            capturePlan.kind !== "sdr_disk"
+          ) {
+            throw err;
+          }
+          // The cache could not stand in for the frames left uncaptured.
+          // Capture them now and encode with every frame on disk.
+          log.warn("[Render] Frame cache could not supply the skipped frames; capturing them.", {
+            frames: sumFrameRuns(captureSkip.skippedRuns),
+            error: err.message,
+          });
+          const captured = await captureFrameRuns(capturePlan, captureSkip.skippedRuns);
+          probeSession = captured.probeSession;
+          lastBrowserConsole = captured.lastBrowserConsole;
+          observability.clearFailure("encode");
+          encodeRes = await encodeDiskFrames({ skippedRuns: [], clips: captureSkip.clips });
+        }
         perfStages.encodeMs = encodeRes.encodeMs;
       }
     } // end SDR capture paths block

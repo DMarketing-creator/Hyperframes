@@ -49,6 +49,7 @@ import {
   runFfmpeg,
   type EngineConfig,
   type EncodeResult,
+  type EncoderOptions,
 } from "@hyperframes/engine";
 import {
   clearGifFramesBeforeNext,
@@ -65,6 +66,16 @@ import {
 } from "./gifEncodeArgs.js";
 import { reportEncodeProgress, updateJobStatus } from "../shared.js";
 import { encoderFailureError } from "../encoderInterruption.js";
+import {
+  encodeWithFrameCache,
+  FrameCacheSkipError,
+  frameCacheEncodeConcurrency,
+  formatFrameCacheSegment,
+  frameCacheGopSize,
+  frameCacheSettings,
+  type FrameCacheEncodeResult,
+} from "../frameCache.js";
+import type { CaptureSkipPlan } from "../captureSkip.js";
 import { frameFileExtension } from "@hyperframes/engine";
 
 export interface EncodeStageInput {
@@ -129,11 +140,122 @@ export interface EncodeStageInput {
    * chunk's frame count for `renderChunk`, `hlsSegmentSeconds × fps` for HLS.
    */
   gopSize?: number;
+  /**
+   * Frame cache directory (see `frameCache.ts`). When set, an mp4 / webm / mov
+   * encode reuses the cached video for frames unchanged since the last render
+   * and saves this render to the cache. Ignored for png-sequence, gif, the
+   * chunked-concat encoder and GPU encoders, which encode as before.
+   */
+  frameCacheDir?: string;
+  /**
+   * The capture skip plan the frames were captured under (see
+   * `captureSkip.ts`). Its skipped runs have no frame files, so only the frame
+   * cache can produce the video; when it cannot, the stage throws
+   * `FrameCacheSkipError` and the sequencer captures those frames and calls
+   * the stage again without skipped runs.
+   */
+  captureSkip?: Pick<CaptureSkipPlan, "skippedRuns" | "clips">;
 }
 
 export interface EncodeStageResult {
   /** Wall-clock ms for the encode (or png-copy) phase. */
   encodeMs: number;
+  /** Set when the frame cache produced the video. */
+  frameCache?: FrameCacheEncodeResult;
+}
+
+function hasSkippedFrames(input: EncodeStageInput): boolean {
+  return (input.captureSkip?.skippedRuns.length ?? 0) > 0;
+}
+
+/**
+ * The frame cache directory when this encode goes through the cache, `null`
+ * when it encodes as before. Throws `FrameCacheSkipError` when frames were
+ * skipped and only the cache could have supplied them.
+ */
+function frameCacheDirFor(input: EncodeStageInput): string | null {
+  const encodesAsBefore =
+    input.isPngSequence ||
+    input.isGif ||
+    input.enableChunkedEncode ||
+    input.job.config.useGpu === true;
+  if (input.frameCacheDir !== undefined && !encodesAsBefore) return input.frameCacheDir;
+  if (hasSkippedFrames(input)) {
+    throw new FrameCacheSkipError("[frameCache] frames were skipped but the cache encode is off");
+  }
+  return null;
+}
+
+/** An HLS render already locks its GOP to the segment length; a cached render keeps that one. */
+function frameCacheGopSizeFor(input: EncodeStageInput): number {
+  return input.lockGopForChunkConcat === true && input.gopSize
+    ? Math.floor(input.gopSize)
+    : frameCacheGopSize(input.preset.codec, input.job.config.fps);
+}
+
+/**
+ * Encode `videoOnlyPath` through the frame cache. Returns `null` when this
+ * encode does not use the cache, or when the cache encode failed and the stage
+ * can still encode every frame without it; with skipped frames it cannot, so
+ * the failure is thrown as `FrameCacheSkipError`.
+ */
+async function encodeThroughFrameCache(
+  input: EncodeStageInput,
+  options: {
+    encoderOpts: EncoderOptions;
+    frameExt: "jpg" | "png";
+    ffmpegTimeout: number;
+    onFramesEncoded: (frames?: number) => void;
+  },
+): Promise<FrameCacheEncodeResult | null> {
+  const cacheDir = frameCacheDirFor(input);
+  if (cacheDir === null) return null;
+  const { job, log } = input;
+  const gopSize = frameCacheGopSizeFor(input);
+  const encoder = { ...options.encoderOpts, lockGopForChunkConcat: true, gopSize };
+  try {
+    const frameCache = await encodeWithFrameCache({
+      cacheDir,
+      framesDir: input.framesDir,
+      frameExt: options.frameExt,
+      videoOnlyPath: input.videoOnlyPath,
+      settings: frameCacheSettings({
+        fps: job.config.fps,
+        format: job.config.format ?? "mp4",
+        imageFormat: options.frameExt,
+        gopSize,
+        encoder,
+      }),
+      encoder,
+      maxParallelEncodes: frameCacheEncodeConcurrency(job.config.workers),
+      totalFrames: job.totalFrames,
+      skippedRuns: input.captureSkip?.skippedRuns,
+      clips: input.captureSkip?.clips,
+      ffmpegTimeout: options.ffmpegTimeout,
+      signal: input.abortSignal,
+      log,
+      onFramesDone: options.onFramesEncoded,
+    });
+    input.assertNotAborted();
+    log.info("[Render] Frame cache", {
+      status: frameCache.status,
+      framesEncoded: frameCache.framesEncoded,
+      framesReused: frameCache.framesReused,
+      framesNotCaptured: frameCache.framesNotCaptured,
+      segments: frameCache.segments.length,
+      segmentMap: frameCache.segments.map(formatFrameCacheSegment),
+    });
+    options.onFramesEncoded();
+    return frameCache;
+  } catch (error) {
+    input.assertNotAborted();
+    // The plain encoder needs every frame file, and some were never captured.
+    if (hasSkippedFrames(input)) throw FrameCacheSkipError.from(error);
+    log.warn("[Render] Frame cache encode failed; encoding every frame without the cache.", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  }
 }
 
 function resolveGifLoop(loop: number | undefined): number {
@@ -279,6 +401,8 @@ export async function runEncodeStage(input: EncodeStageInput): Promise<EncodeSta
   } = input;
 
   const stage5Start = Date.now();
+  // Before anything is written: skipped frames need the cache encode.
+  frameCacheDirFor(input);
 
   if (isPngSequence) {
     // ── Stage 5 (png-sequence): copy captured PNGs to outputDir ──────
@@ -375,6 +499,14 @@ export async function runEncodeStage(input: EncodeStageInput): Promise<EncodeSta
     lockGopForChunkConcat: input.lockGopForChunkConcat === true,
     gopSize: input.gopSize,
   };
+  const frameCache = await encodeThroughFrameCache(input, {
+    encoderOpts,
+    frameExt,
+    ffmpegTimeout: videoEngineCfg.ffmpegEncodeTimeout,
+    onFramesEncoded,
+  });
+  if (frameCache) return { encodeMs: Date.now() - stage5Start, frameCache };
+
   const encodeResult = enableChunkedEncode
     ? await encodeFramesChunkedConcat(
         framesDir,

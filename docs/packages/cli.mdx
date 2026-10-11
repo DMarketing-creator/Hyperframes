@@ -1055,6 +1055,95 @@ keep their existing routes.
 | `HF_SEGMENT_FRAMES`            | `3000`     | Frames per segment (~100 s at 30 fps); minimum 30                                        |
 | `HF_SEGMENT_BROWSER_RECYCLE`   | `3`        | Restart the browser every N segments; `0` keeps one session for the whole render          |
 
+#### Frame cache
+
+A disk-path render keeps a hash of each captured frame and its encoded video
+in `renders/.hf-frame-cache/`. The next render compares each captured frame
+with the cached frame at the same index and builds a segment map: `reuse`
+segments are stream-copied out of the cached video, `render` segments are
+encoded from the new frames, and all of them are merged in frame order.
+Afterwards the cache holds the new render.
+
+Sections the render can tell are unchanged before capturing them are not
+captured at all (see [Capture skipping](#capture-skipping) below), which is
+where most of the time goes: edit one scene of a three-scene, 60-second
+composition and the render captures and encodes that scene only.
+
+The map is logged with the render, one line per segment:
+
+```
+reuse 00:00-02:00 (frames 0-3600)
+render 02:00-05:00 (frames 3600-9000)
+reuse 05:00-08:00 (frames 9000-14400)
+```
+
+- A stream copy can only cut on a keyframe, so cached renders are encoded with
+  a closed GOP of one second (one frame for ProRes, the segment length for
+  HLS), and a changed frame renders the whole GOP it sits in.
+- When the map has several `render` segments, two are encoded at once.
+  `--workers N` sets that number instead, so `--workers 1` encodes them one at
+  a time.
+- An identical stretch shorter than two seconds is rendered with its
+  neighbours instead of being cut out on its own.
+- The cache is ignored, and rebuilt, when fps, resolution, format, codec,
+  preset, quality or bitrate differ from the cached render's.
+- The cache does not keep the frame images, only a SHA-256 of each frame's
+  image file. A frame counts as unchanged when its file hashes to the cached
+  value; a frame whose file differs at all is rendered again.
+- The cache is the size of one render's video plus 32 bytes per frame.
+  Deleting the directory is always safe.
+
+mp4, webm, mov and hls on the disk path only. Streaming, segmented and HDR
+capture, png-sequence, gif, GPU encoders and `PRODUCER_ENABLE_CHUNKED_ENCODE`
+render as before. That includes the CLI's default render and `--workers 1`,
+which stream frames straight into the encoder; `--workers 2` or more renders
+on the disk path and uses the cache.
+
+##### Capture skipping
+
+Before capture, the render fingerprints the loaded page: one hash per
+top-level timed element (`[data-start]`) over everything inside it
+(attributes, text, computed styles) and the GSAP tweens that target it, and
+one hash for everything else, including the bytes of every file the page
+loaded. A frame is predicted unchanged when no clip active at that frame, and
+nothing outside the clips, differs from the cached render.
+
+A prediction alone does not skip a capture. Each render also captures up to 32
+probe frames spread over the timeline and keeps their hashes; a predicted
+section is skipped only when every probe frame inside it matches the cached
+render's. The rest of the timeline is captured as usual, and the log says what
+was skipped:
+
+```
+[Render] Frame cache capture plan { framesSkipped: 1140, capture: ["570-1230"], probedFrames: 30 }
+```
+
+- Sections are skipped in whole GOPs of the cached render, two seconds or
+  longer, so the frames just around an edit are captured as well.
+- A change outside every clip (the root element, a stylesheet, a script, a
+  font or image file) captures the whole timeline.
+- The page is not fingerprinted, and every frame is captured, when it holds
+  something the fingerprint cannot see into: `<video>`, `<canvas>`, `<iframe>`,
+  embedded objects, SVG or Lottie animation, CSS or Web Animations API
+  animation, shadow DOM, a registered frame source, a function in a tween
+  (callbacks, modifiers, function-based values; eases are fine), a file loaded
+  from another origin, or more than 5000 elements. `reason` in the log line
+  names what it was.
+- Skipping needs screenshot capture; with BeginFrame or drawElement capture
+  every frame is captured and only the encode is reused.
+- A skipped section is the cached render's video, so the output is not
+  byte-identical to a full render of the same composition. On the 60-second
+  test composition 1356 of 1800 frames decode to identical pixels and the
+  rest stay above 56 dB PSNR.
+- If the cache turns out unable to supply a skipped section (for example
+  `--quality` changed since the cached render), the render captures it and
+  carries on.
+
+| Environment variable          | Default | Effect                                                |
+| ----------------------------- | ------- | ----------------------------------------------------- |
+| `HF_FRAME_CACHE`              | on      | `false` turns the cache off for the render            |
+| `HF_FRAME_CACHE_SKIP_CAPTURE` | on      | `false` captures every frame and only reuses encodes  |
+
 #### Render the same composition with different content
 
 Declare the variables on the composition root, read them inside it, then

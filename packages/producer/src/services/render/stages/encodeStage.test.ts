@@ -34,6 +34,8 @@ const runFfmpegMock = mock(async () => ({
 mock.module("@hyperframes/engine", () => ({
   MIXED_AUDIO_FILENAME: "audio.m4a",
   DEFAULT_CONFIG: { ffmpegEncodeTimeout: 600_000 },
+  buildConcatArgs: () => [],
+  buildEncoderArgs: () => [],
   encodeFramesChunkedConcat: encodeFramesChunkedConcatMock,
   encodeFramesFromDir: encodeFramesFromDirMock,
   frameFileExtension: (format: string | undefined) => (format === "png" ? "png" : "jpg"),
@@ -437,17 +439,7 @@ describe("runEncodeStage config plumbing", () => {
   });
 
   it("uses resolved engine config for GIF ffmpeg timeouts", async () => {
-    const { runEncodeStage } = await import("./encodeStage.js");
-    const paths = createFramesDir("jpg");
-
-    await runEncodeStage(
-      makeInput({
-        framesDir: paths.framesDir,
-        outputPath: join(paths.root, "out.gif"),
-        videoOnlyPath: join(paths.root, "video-only.mp4"),
-        isGif: true,
-      }),
-    );
+    await encodeOpaqueGif();
 
     expect(runFfmpegMock).toHaveBeenCalledTimes(2);
     expect(runFfmpegMock.mock.calls[0]?.[1]?.timeout).toBe(
@@ -457,6 +449,21 @@ describe("runEncodeStage config plumbing", () => {
       resolvedEngineConfig.ffmpegEncodeTimeout,
     );
   });
+
+  async function encodeOpaqueGif(overrides: Parameters<typeof makeInput>[0] = {}) {
+    const { runEncodeStage } = await import("./encodeStage.js");
+    const paths = createFramesDir("jpg");
+    await runEncodeStage(
+      makeInput({
+        framesDir: paths.framesDir,
+        outputPath: join(paths.root, "out.gif"),
+        videoOnlyPath: join(paths.root, "video-only.mp4"),
+        isGif: true,
+        ...overrides,
+      }),
+    );
+    return paths;
+  }
 
   async function encodeAlphaGif(paths: { framesDir: string; root: string }, outputPath: string) {
     const { runEncodeStage } = await import("./encodeStage.js");
@@ -530,18 +537,7 @@ describe("runEncodeStage config plumbing", () => {
   });
 
   it("keeps opaque GIF encoding on JPEG frames without alpha-only filters", async () => {
-    const { runEncodeStage } = await import("./encodeStage.js");
-    const paths = createFramesDir("jpg");
-
-    await runEncodeStage(
-      makeInput({
-        framesDir: paths.framesDir,
-        outputPath: join(paths.root, "out.gif"),
-        videoOnlyPath: join(paths.root, "video-only.mp4"),
-        isGif: true,
-        needsAlpha: false,
-      }),
-    );
+    const paths = await encodeOpaqueGif({ needsAlpha: false });
 
     expect(runFfmpegMock.mock.calls[1]?.[0]).not.toContain("-gifflags");
     expect(runFfmpegMock.mock.calls[0]?.[0]).toContain(join(paths.framesDir, "frame_%06d.jpg"));
