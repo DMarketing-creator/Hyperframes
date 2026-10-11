@@ -1,6 +1,8 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import fs from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { globalMediaDir } from "./media-home.mjs";
+import { withFileLock } from "./config-lock.mjs";
 
 /**
  * Remembered defaults — the lightweight tier of HyperFrames user memory.
@@ -68,12 +70,31 @@ function readPrefsFile(path) {
   }
 }
 
-/** Atomic write (tmp + rename) so a crash never leaves a torn file. */
+/** Atomic write (tmp + rename) so a crash never leaves a torn file. The tmp
+ *  name carries the pid (as telemetry.mjs does): parallel `record` processes
+ *  used to share one fixed tmp name and the loser's rename died with ENOENT.
+ *  Best-effort cleanup of our own tmp covers a crash between write and rename;
+ *  only this pid's name is ever removed. */
 function writePrefsFile(path, file) {
   mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.tmp`;
-  writeFileSync(tmp, `${JSON.stringify(file, null, 2)}\n`);
-  renameSync(tmp, path);
+  const tmp = `${path}.${process.pid}.tmp`;
+  try {
+    writeFileSync(tmp, `${JSON.stringify(file, null, 2)}\n`);
+    renameSync(tmp, path);
+  } finally {
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      // The rename already moved it, or the directory went away — either fine.
+    }
+  }
+}
+
+/** Run `fn` with the prefs file's lock held, re-reading under it. Creates
+ *  the parent directory first: the lock file itself cannot create it. */
+function lockedUpdate(path, fn) {
+  mkdirSync(dirname(path), { recursive: true });
+  return withFileLock(`${path}.lock`, fs, fn);
 }
 
 /** `style_preset` entries are stored per workflow as `style_preset.<workflow>`. */
@@ -113,15 +134,19 @@ function dedupe(list) {
  */
 function recordProjectTier(projectDir, fullKey, value, projectName, now) {
   const path = projectPrefsPath(projectDir);
-  const file = readPrefsFile(path);
-  const previous = file.preferences[fullKey];
-  const keepProvenance = validEntry(previous) && previous.value === value;
-  const confirmedIn = keepProvenance
-    ? dedupe([...(Array.isArray(previous.confirmed_in) ? previous.confirmed_in : []), projectName])
-    : [projectName];
-  file.preferences[fullKey] = { value, confirmed_in: confirmedIn, updated_at: now };
-  writePrefsFile(path, file);
-  return confirmedIn;
+  // Serialized: parallel records otherwise read the same file and the last
+  // writer silently drops the others' keys (#5333).
+  return lockedUpdate(path, () => {
+    const file = readPrefsFile(path);
+    const previous = file.preferences[fullKey];
+    const keepProvenance = validEntry(previous) && previous.value === value;
+    const confirmedIn = keepProvenance
+      ? dedupe([...(Array.isArray(previous.confirmed_in) ? previous.confirmed_in : []), projectName])
+      : [projectName];
+    file.preferences[fullKey] = { value, confirmed_in: confirmedIn, updated_at: now };
+    writePrefsFile(path, file);
+    return confirmedIn;
+  });
 }
 
 /**
@@ -130,20 +155,22 @@ function recordProjectTier(projectDir, fullKey, value, projectName, now) {
  */
 function recordUserSighting(fullKey, value, projectName, now) {
   const path = userPrefsPath();
-  const file = readPrefsFile(path);
-  const keySightings = isRecord(file.sightings[fullKey]) ? file.sightings[fullKey] : {};
-  const seenIn = dedupe([
-    ...(Array.isArray(keySightings[value]) ? keySightings[value] : []),
-    projectName,
-  ]);
-  keySightings[value] = seenIn;
-  file.sightings[fullKey] = keySightings;
-  const promoted = seenIn.length >= PROMOTE_AT;
-  if (promoted) {
-    file.preferences[fullKey] = { value, confirmed_in: seenIn, updated_at: now };
-  }
-  writePrefsFile(path, file);
-  return promoted;
+  return lockedUpdate(path, () => {
+    const file = readPrefsFile(path);
+    const keySightings = isRecord(file.sightings[fullKey]) ? file.sightings[fullKey] : {};
+    const seenIn = dedupe([
+      ...(Array.isArray(keySightings[value]) ? keySightings[value] : []),
+      projectName,
+    ]);
+    keySightings[value] = seenIn;
+    file.sightings[fullKey] = keySightings;
+    const promoted = seenIn.length >= PROMOTE_AT;
+    if (promoted) {
+      file.preferences[fullKey] = { value, confirmed_in: seenIn, updated_at: now };
+    }
+    writePrefsFile(path, file);
+    return promoted;
+  });
 }
 
 /**
