@@ -1,5 +1,7 @@
 import { runCommand } from "citty";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import childProcess from "node:child_process";
+import fs from "node:fs";
 import {
   chmodSync,
   mkdirSync,
@@ -13,65 +15,58 @@ import {
   symlinkSync,
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { WhisperUnavailableError } from "../whisper/manager.js";
 import { formatVtt, loadTranscript } from "../whisper/normalize.js";
+import * as parakeet from "../whisper/parakeet.js";
+import * as sherpa from "../whisper/sherpa.js";
+import * as whisper from "../whisper/transcribe.js";
 import { CliRuntimeError, consumeCommandResult } from "../utils/commandResult.js";
+import transcribeCmd from "./transcribe.js";
 
 // Make the whisper core report "unavailable" so we exercise the soft-skip path.
 const transcribeMock = vi.fn();
 const prepareWavMock = vi.fn((input: string) => input);
 let audioSeconds = 1;
-vi.mock("node:fs", async (importOriginal) => {
-  const fs = await importOriginal<typeof import("node:fs")>();
-  return { ...fs, statSync: vi.fn(fs.statSync) };
-});
-
-vi.mock("../whisper/transcribe.js", () => ({
-  transcribe: transcribeMock,
-  prepareWav: (input: string) => prepareWavMock(input),
-  getPreparedWavDurationSeconds: () => audioSeconds,
-}));
 
 // Engine selection: which runners look installed, and the sherpa decode child it spawns.
 const runners = { sherpa: false, mlx: false };
 let runtimeDir: string;
-vi.mock("../whisper/sherpa.js", async (importOriginal) => {
-  const sherpa = await importOriginal<typeof import("../whisper/sherpa.js")>();
-  return {
-    ...sherpa,
-    sherpaParakeetInstalled: () => runners.sherpa,
-    transcribeWithSherpa: (
-      wavPath: string,
-      dir: string,
-      options: Parameters<typeof sherpa.transcribeWithSherpa>[2],
-    ) =>
-      sherpa.transcribeWithSherpa(wavPath, dir, {
-        ...options,
-        runtimeDir,
-        cliUrl: pathToFileURL(join(runtimeDir, "dist", "cli.js")).href,
-      }),
-  };
-});
+const realTranscribeWithSherpa = sherpa.transcribeWithSherpa;
+const realTranscribeWithParakeet = parakeet.transcribeWithParakeet;
+const realPrepareWav = whisper.prepareWav;
 const mlxMock = vi.fn();
-vi.mock("../whisper/parakeet.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../whisper/parakeet.js")>()),
-  findParakeet: () => (runners.mlx ? "/bin/parakeet-mlx" : undefined),
-  transcribeWithParakeet: (...a: unknown[]) => mlxMock(...a),
-}));
 const execFileMock = vi.fn();
-vi.mock("node:child_process", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("node:child_process")>()),
-  execFile: (...a: unknown[]) => execFileMock(...a),
-}));
 
 const trackTranscribeUnavailable = vi.fn();
 vi.mock("../telemetry/events.js", () => ({
   trackTranscribeUnavailable: (...a: unknown[]) => trackTranscribeUnavailable(...a),
 }));
 
-import transcribeCmd from "./transcribe.js";
+/** The runners the command reaches, replaced for each test because afterEach restores every spy. */
+function replaceRunners(): void {
+  vi.spyOn(whisper, "transcribe").mockImplementation((...a) => transcribeMock(...a));
+  vi.spyOn(whisper, "prepareWav").mockImplementation(async (input) => prepareWavMock(input));
+  vi.spyOn(whisper, "getPreparedWavDurationSeconds").mockImplementation(() => audioSeconds);
+  vi.spyOn(sherpa, "sherpaParakeetInstalled").mockImplementation(() => runners.sherpa);
+  vi.spyOn(sherpa, "transcribeWithSherpa").mockImplementation((wavPath, dir, options) =>
+    realTranscribeWithSherpa(wavPath, dir, {
+      ...options,
+      runtimeDir,
+      cliUrl: pathToFileURL(join(runtimeDir, "dist", "cli.js")).href,
+    }),
+  );
+  vi.spyOn(parakeet, "findParakeet").mockImplementation(() =>
+    runners.mlx ? "/bin/parakeet-mlx" : undefined,
+  );
+  vi.spyOn(parakeet, "transcribeWithParakeet").mockImplementation((...a) => mlxMock(...a));
+  vi.spyOn(childProcess, "execFile").mockImplementation(((...a: unknown[]) =>
+    execFileMock(...a)) as unknown as typeof childProcess.execFile);
+  // Node's named exports of a builtin follow its default export only once synced.
+  syncBuiltinESMExports();
+}
 
 /** Makes each runner write a one-word transcript naming itself. */
 function fakeTranscript(dir: string, text: string) {
@@ -103,6 +98,7 @@ describe("transcribe command", () => {
   beforeEach(() => {
     dirs = [];
     consumeCommandResult();
+    replaceRunners();
     transcribeMock.mockReset();
     prepareWavMock.mockReset().mockImplementation((input: string) => input);
     trackTranscribeUnavailable.mockReset();
@@ -118,6 +114,7 @@ describe("transcribe command", () => {
     consumeCommandResult();
     for (const d of dirs) rmSync(d, { recursive: true, force: true });
     vi.restoreAllMocks();
+    syncBuiltinESMExports();
     vi.unstubAllEnvs();
   });
 
@@ -297,8 +294,6 @@ describe("transcribe command", () => {
     it.skipIf(process.platform === "win32")(
       "lets parakeet-mlx detect the language itself, since it has no --language option",
       async () => {
-        const parakeet =
-          await vi.importActual<typeof import("../whisper/parakeet.js")>("../whisper/parakeet.js");
         // Rejects --language the way parakeet-mlx does, and writes one token otherwise.
         const runner = join(runtimeDir, "parakeet-mlx");
         writeFileSync(
@@ -313,7 +308,7 @@ echo '{"sentences":[{"tokens":[{"text":" hola","start":0,"end":1}]}]}' > "$2/$(b
         );
         chmodSync(runner, 0o755);
         vi.stubEnv("HYPERFRAMES_PARAKEET", runner);
-        mlxMock.mockImplementation(parakeet.transcribeWithParakeet);
+        mlxMock.mockImplementation(realTranscribeWithParakeet);
 
         expect(await transcribeWith("auto", { sherpa: false, mlx: true }, "es")).toMatchObject({
           engine: "parakeet",
@@ -514,10 +509,7 @@ echo '{"sentences":[{"tokens":[{"text":" hola","start":0,"end":1}]}]}' > "$2/$(b
           "ffmpeg failed: Error opening output files: Invalid argument\nOutput file does not contain any stream",
         ],
       ])("after saying %j, the run exits %i", async (said, code, error) => {
-        const actual = await vi.importActual<typeof import("../whisper/transcribe.js")>(
-          "../whisper/transcribe.js",
-        );
-        prepareWavMock.mockImplementation((input: string) => actual.prepareWav(input));
+        vi.mocked(whisper.prepareWav).mockImplementation(realPrepareWav);
         const dir = mkdtempSync(join(tmpdir(), "hf-transcribe-ffmpeg-"));
         dirs.push(dir);
         const ffmpeg = join(dir, "ffmpeg");
@@ -837,11 +829,12 @@ Render video. Built for agents.
   });
 
   async function runWithInodeZero(zero: (path: string) => boolean, args: object): Promise<void> {
-    const fs = await vi.importActual<typeof import("node:fs")>("node:fs");
-    vi.mocked(statSync).mockImplementation(((path: string, options?: object) => {
-      const stats = fs.statSync(path, options);
+    const realStatSync = fs.statSync;
+    vi.spyOn(fs, "statSync").mockImplementation(((path: string, options?: object) => {
+      const stats = realStatSync(path, options);
       return zero(String(path)) ? Object.assign(stats, { ino: 0n }) : stats;
     }) as unknown as typeof statSync);
+    syncBuiltinESMExports();
     transcribeMock.mockImplementation(async (_input, outputDir) =>
       fakeTranscript(outputDir, "whisper"),
     );
@@ -850,7 +843,8 @@ Render video. Built for agents.
     } catch (err) {
       if (!(err instanceof CliRuntimeError)) throw err;
     } finally {
-      vi.mocked(statSync).mockImplementation(fs.statSync);
+      vi.mocked(fs.statSync).mockRestore();
+      syncBuiltinESMExports();
     }
   }
 

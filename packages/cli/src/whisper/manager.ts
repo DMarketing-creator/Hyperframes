@@ -5,6 +5,7 @@ import { homedir, platform } from "node:os";
 import { join } from "node:path";
 import { findFFmpeg } from "../browser/ffmpeg.js";
 import { downloadFile } from "../utils/download.js";
+import { stoppableExecFile } from "../utils/stoppableExecFile.js";
 
 const MODELS_DIR = join(homedir(), ".cache", "hyperframes", "whisper", "models");
 const DEFAULT_MODEL = "small.en";
@@ -96,7 +97,10 @@ function findBuiltBinary(): WhisperResult | undefined {
   return undefined;
 }
 
-function buildFromSource(onProgress?: (msg: string) => void): WhisperResult {
+async function buildFromSource(
+  onProgress?: (msg: string) => void,
+  signal?: AbortSignal,
+): Promise<WhisperResult> {
   // Clean stale builds — if BUILD_DIR exists but has no binary, nuke and re-clone
   if (existsSync(BUILD_DIR) && !findBuiltBinary()) {
     rmSync(BUILD_DIR, { recursive: true, force: true });
@@ -107,24 +111,27 @@ function buildFromSource(onProgress?: (msg: string) => void): WhisperResult {
     mkdirSync(join(homedir(), ".cache", "hyperframes", "whisper"), {
       recursive: true,
     });
-    execFileSync("git", ["clone", "--depth", "1", WHISPER_REPO, BUILD_DIR], {
+    await stoppableExecFile("git", ["clone", "--depth", "1", WHISPER_REPO, BUILD_DIR], {
       stdio: "ignore",
       timeout: 60_000,
       env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      signal,
     });
   }
 
   onProgress?.("Building whisper.cpp (this may take a minute)...");
   try {
-    execFileSync("cmake", ["-B", "build"], {
+    await stoppableExecFile("cmake", ["-B", "build"], {
       cwd: BUILD_DIR,
       stdio: ["pipe", "pipe", "pipe"],
       timeout: 120_000,
+      signal,
     });
-    execFileSync("cmake", ["--build", "build", "--config", "Release", "-j"], {
+    await stoppableExecFile("cmake", ["--build", "build", "--config", "Release", "-j"], {
       cwd: BUILD_DIR,
       stdio: ["pipe", "pipe", "pipe"],
       timeout: 300_000,
+      signal,
     });
   } catch (err: unknown) {
     // Build failed — capture diagnostics, then clean up so next attempt starts fresh
@@ -189,7 +196,10 @@ function hasCmake(): boolean {
 export async function ensureWhisper(options?: {
   installRuntime?: boolean;
   onProgress?: (msg: string) => void;
+  /** Aborting it stops an install in progress and rejects with the reason, trying nothing else. */
+  signal?: AbortSignal;
 }): Promise<WhisperResult> {
+  const signal = options?.signal;
   // 1. Already installed?
   const existing = findWhisper();
   if (existing) return existing;
@@ -203,24 +213,27 @@ export async function ensureWhisper(options?: {
   if (platform() === "darwin" && hasBrew()) {
     options?.onProgress?.("Installing whisper-cpp via Homebrew...");
     try {
-      execFileSync("brew", ["install", "whisper-cpp"], {
+      await stoppableExecFile("brew", ["install", "whisper-cpp"], {
         stdio: "ignore",
         timeout: 300_000,
+        signal,
       });
       const installed = findFromSystem();
       if (installed) return { ...installed, source: "brew" };
     } catch {
       // brew failed — fall through
     }
+    signal?.throwIfAborted();
   }
 
   // 3. Build from source (needs git + cmake + C compiler)
   if (hasGit() && hasCmake()) {
     try {
-      return buildFromSource(options?.onProgress);
+      return await buildFromSource(options?.onProgress, signal);
     } catch {
       // build failed — fall through
     }
+    signal?.throwIfAborted();
   }
 
   // 4. Give up — tell the user how
@@ -230,6 +243,7 @@ export async function ensureWhisper(options?: {
 export async function ensureModel(
   model: string = DEFAULT_MODEL,
   options?: {
+    signal?: AbortSignal;
     onProgress?: (message: string) => void;
     onDownloadProgress?: (receivedBytes: number, totalBytes: number | null) => void;
   },
@@ -240,7 +254,10 @@ export async function ensureModel(
   mkdirSync(MODELS_DIR, { recursive: true });
 
   options?.onProgress?.(`Downloading model ${model}...`);
-  await downloadFile(getModelUrl(model), modelPath, { onProgress: options?.onDownloadProgress });
+  await downloadFile(getModelUrl(model), modelPath, {
+    signal: options?.signal,
+    onProgress: options?.onDownloadProgress,
+  });
 
   if (!existsSync(modelPath)) {
     throw new Error(`Model download failed: ${model}`);

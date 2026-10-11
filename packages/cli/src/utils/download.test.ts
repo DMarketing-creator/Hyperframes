@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { ensureModel } from "../whisper/manager.js";
+import { MODELS_DIR, ensureModel } from "../whisper/manager.js";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import fs, { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -10,16 +11,7 @@ import type { ClientRequest, IncomingMessage } from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { downloadFile, REDIRECT_CODES, redirectTarget } from "./download.js";
 
-const { unlinkSyncMock } = vi.hoisted(() => ({
-  unlinkSyncMock: vi.fn(),
-}));
-
 vi.mock("node:https", () => ({ get: vi.fn() }));
-vi.mock("node:fs", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("node:fs")>();
-  unlinkSyncMock.mockImplementation(actual.unlinkSync);
-  return { ...actual, unlinkSync: unlinkSyncMock };
-});
 
 const mockGet = vi.mocked(httpsGet);
 const tempDirs: string[] = [];
@@ -51,10 +43,46 @@ function httpsResponse(
 
 afterEach(() => {
   vi.clearAllMocks();
+  vi.restoreAllMocks();
+  syncBuiltinESMExports();
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
 describe("downloadFile", () => {
+  it("hands https.get the caller's signal, so aborting a model download removes the partial file", async () => {
+    let seen: AbortSignal | undefined;
+    mockGet.mockImplementation(((
+      _url: string,
+      options: { signal?: AbortSignal },
+      callback: (response: IncomingMessage) => void,
+    ) => {
+      seen = options.signal;
+      const response = Object.assign(new PassThrough(), { statusCode: 200, headers: {} });
+      const request = new EventEmitter() as ClientRequest;
+      request.setTimeout = vi.fn();
+      callback(response as unknown as IncomingMessage);
+      response.write("partial");
+      // What Node does with a request whose signal aborts.
+      options.signal?.addEventListener("abort", () =>
+        request.emit(
+          "error",
+          Object.assign(new Error("The operation was aborted"), { name: "AbortError" }),
+        ),
+      );
+      return request;
+    }) as unknown as typeof httpsGet);
+    const controller = new AbortController();
+    const model = `test-${randomUUID()}`;
+
+    const download = ensureModel(model, { signal: controller.signal });
+    await new Promise((resolve) => setImmediate(resolve));
+    controller.abort();
+
+    await expect(download).rejects.toThrow("The operation was aborted");
+    expect(seen).toBe(controller.signal);
+    expect(readdirSync(MODELS_DIR).filter((name) => name.includes(model))).toEqual([]);
+  });
+
   it("carries model download progress through the real pipeline and stays quiet on cache hits", async () => {
     mockGet.mockImplementation(httpsResponse(200, { "content-length": "5" }, "hello"));
     const events: unknown[] = [];
@@ -123,16 +151,18 @@ describe("downloadFile", () => {
   });
 
   it("rejects an idle response and removes the partial file", async () => {
-    const actualFs = await vi.importActual<typeof import("node:fs")>("node:fs");
     let responseClosed = false;
-    unlinkSyncMock.mockImplementation((path) => {
+    const realUnlinkSync = fs.unlinkSync;
+    vi.spyOn(fs, "unlinkSync").mockImplementation((path) => {
       if (!responseClosed) {
         const error = new Error("file is locked");
         Object.assign(error, { code: "EBUSY" });
         throw error;
       }
-      actualFs.unlinkSync(path);
+      realUnlinkSync(path);
     });
+    // Node's named exports of a builtin follow its default export only once synced.
+    syncBuiltinESMExports();
 
     mockGet.mockImplementation(((_url: string, callback: (response: IncomingMessage) => void) => {
       const response = new PassThrough() as PassThrough & {

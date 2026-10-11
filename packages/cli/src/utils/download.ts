@@ -13,6 +13,8 @@ export interface DownloadOptions {
   /** Reject before writing more than this many response bytes. */
   maxBytes?: number;
   onProgress?: (receivedBytes: number, totalBytes: number | null) => void;
+  /** Aborting it destroys the request and removes the partial file. */
+  signal?: AbortSignal;
 }
 
 /** Every redirect a host may reasonably answer with, not just the two we saw first. */
@@ -65,6 +67,14 @@ function measureDownload(options: DownloadOptions, contentLength: string | undef
   return { stream, complete: () => options.onProgress?.(receivedBytes, totalBytes) };
 }
 
+function getUrl(
+  url: string,
+  signal: AbortSignal | undefined,
+  onResponse: (res: IncomingMessage) => void,
+): ClientRequest {
+  return signal ? httpsGet(url, { signal }, onResponse) : httpsGet(url, onResponse);
+}
+
 /**
  * Download a file from a URL, following redirects.
  * Uses atomic write (download to .tmp, rename on success) to prevent
@@ -93,7 +103,7 @@ export function downloadFile(
       let requestError: Error | undefined;
       let request: ClientRequest;
       try {
-        request = httpsGet(u, (res) => {
+        request = getUrl(u, options.signal, (res) => {
           activeResponse = res;
           if (res.statusCode && REDIRECT_CODES.has(res.statusCode)) {
             const location = res.headers.location;

@@ -1,12 +1,20 @@
 import { failCommand } from "../utils/commandResult.js";
 import { defineCommand } from "citty";
-import { resolve } from "node:path";
 import { existsSync } from "node:fs";
 import * as clack from "@clack/prompts";
 import { c } from "../ui/colors.js";
-import { isDevice, DEVICES } from "../background-removal/manager.js";
+import {
+  DEFAULT_MODEL,
+  DEVICES,
+  MODEL_MEMORY_MB,
+  isDevice,
+  listAvailableProviders,
+  modelPath,
+  selectProviders,
+} from "../background-removal/manager.js";
 import { DEFAULT_QUALITY, QUALITIES, isQuality } from "../background-removal/pipeline.js";
 import type { Example } from "./_examples.js";
+import { RemoveBackgroundError, removeBackground } from "../api/removeBackground.js";
 
 export const examples: Example[] = [
   [
@@ -113,21 +121,14 @@ export default defineCommand({
       failCommand();
     }
 
-    const inputPath = resolve(args.input);
-    const outputPath = resolve(args.output);
-    const backgroundOutputArg = args["background-output"];
-    const backgroundOutputPath = backgroundOutputArg ? resolve(backgroundOutputArg) : undefined;
-
-    const { render } = await import("../background-removal/pipeline.js");
-
     const spin = args.json ? null : clack.spinner();
     spin?.start("Preparing background-removal pipeline...");
 
     try {
-      const result = await render({
-        inputPath,
-        outputPath,
-        backgroundOutputPath,
+      const result = await removeBackground({
+        input: args.input,
+        output: args.output,
+        backgroundOutput: args["background-output"],
         device: args.device,
         quality: args.quality,
         onProgress: (event) => {
@@ -181,15 +182,17 @@ export default defineCommand({
       } else {
         spin?.stop(c.error(`Background removal failed: ${message}`));
       }
-      failCommand(1, err);
+      failCommand(1, pipelineError(err));
     }
   },
 });
 
-async function showInfo(json: boolean): Promise<void> {
-  const { selectProviders, listAvailableProviders, DEFAULT_MODEL, MODEL_MEMORY_MB, modelPath } =
-    await import("../background-removal/manager.js");
+/** The pipeline's own error, which the command reported before the API wrapped it. */
+function pipelineError(err: unknown): unknown {
+  return err instanceof RemoveBackgroundError ? err.cause : err;
+}
 
+async function showInfo(json: boolean): Promise<void> {
   const providers = listAvailableProviders();
   const auto = selectProviders("auto");
   const cached = existsSync(modelPath());

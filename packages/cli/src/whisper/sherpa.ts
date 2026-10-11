@@ -31,7 +31,7 @@ import {
   getPreparedWavDurationSeconds,
   prepareWav,
   type TranscribeProgress,
-  type TranscribeResult,
+  type RunnerResult,
 } from "./transcribe.js";
 
 const RUNTIME = "sherpa-onnx-node";
@@ -439,12 +439,13 @@ function decode(
 }
 
 /** Prepares the audio for Parakeet and its fallback alike; ffmpeg stopped by Ctrl-C is a cancel. */
-export function prepareSherpaWav(
+export async function prepareSherpaWav(
   inputPath: string,
   onProgress?: (message: string) => void,
-): string {
+  signal?: AbortSignal,
+): Promise<string> {
   try {
-    return prepareWav(inputPath, onProgress);
+    return await prepareWav(inputPath, onProgress, signal);
   } catch (err) {
     if ((err as { cancelled?: boolean }).cancelled) {
       throw new DecodeCancelled("Transcription cancelled");
@@ -464,7 +465,7 @@ export async function transcribeWithSherpa(
     cliUrl?: string;
     onEvent?: (event: TranscribeProgress) => void;
   },
-): Promise<TranscribeResult> {
+): Promise<RunnerResult> {
   options.onProgress?.("Transcribing with Parakeet...");
   options.onEvent?.({
     type: "progress",

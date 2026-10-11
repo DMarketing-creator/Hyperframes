@@ -299,7 +299,7 @@ describe("getPreparedWavDurationSeconds", () => {
 });
 
 describe.skipIf(process.platform === "win32")("prepareWav", () => {
-  it("removes the partial WAV when ffmpeg fails or is stopped", () => {
+  it("removes the partial WAV when ffmpeg fails or is stopped", async () => {
     const dir = mkdtempSync(join(tmpdir(), "hf-prepare-wav-"));
     const ffmpeg = join(dir, "ffmpeg");
     writeFileSync(
@@ -313,7 +313,7 @@ describe.skipIf(process.platform === "win32")("prepareWav", () => {
     process.env.HYPERFRAMES_FFMPEG_PATH = ffmpeg;
     try {
       for (const input of ["talk.mp3", "talk.mp4"]) {
-        expect(() => prepareWav(join(dir, input))).toThrow(/Command failed/);
+        await expect(prepareWav(join(dir, input))).rejects.toThrow(/Command failed/);
         expect(leftovers()).toEqual([]);
       }
     } finally {
@@ -323,7 +323,7 @@ describe.skipIf(process.platform === "win32")("prepareWav", () => {
     }
   });
 
-  function failWith(script: string): unknown {
+  async function failWith(script: string): Promise<unknown> {
     const dir = mkdtempSync(join(tmpdir(), "hf-prepare-wav-"));
     const ffmpeg = join(dir, "ffmpeg");
     writeFileSync(ffmpeg, `#!${process.execPath}\n${script}\n`);
@@ -331,7 +331,7 @@ describe.skipIf(process.platform === "win32")("prepareWav", () => {
     const saved = process.env.HYPERFRAMES_FFMPEG_PATH;
     process.env.HYPERFRAMES_FFMPEG_PATH = ffmpeg;
     try {
-      prepareWav(join(dir, "talk.mp3"));
+      await prepareWav(join(dir, "talk.mp3"));
     } catch (err) {
       return err;
     } finally {
@@ -342,22 +342,25 @@ describe.skipIf(process.platform === "win32")("prepareWav", () => {
     throw new Error("prepareWav did not fail");
   }
 
-  it("keeps ffmpeg's stderr on the error, so the cause above its summary line is shown", () => {
+  it("keeps ffmpeg's stderr on the error, so the cause above its summary line is shown", async () => {
     const said =
       "Output file does not contain any stream\nError opening output files: Invalid argument";
-    const err = failWith(`process.stderr.write(${JSON.stringify(said)}); process.exit(234);`);
+    const err = await failWith(`process.stderr.write(${JSON.stringify(said)}); process.exit(234);`);
     expect(err).toMatchObject({ cancelled: false, stderr: said });
   });
 
-  it("reads a cancel only from ffmpeg's own signal line, not a path that mentions one", () => {
+  it("reads a cancel only from ffmpeg's own signal line, not a path that mentions one", async () => {
     const said = "/in/received signal.mp3: Invalid data found when processing input";
-    const err = failWith(`process.stderr.write(${JSON.stringify(said)}); process.exit(255);`);
+    const err = await failWith(`process.stderr.write(${JSON.stringify(said)}); process.exit(255);`);
     expect(err).toMatchObject({ cancelled: false });
   });
 
-  it("rethrows Node's own failure (output overflow) as is, never as a cancel", () => {
+  it("rethrows Node's own failure (output overflow) as is, never as a cancel", async () => {
     const flood = `require("fs").writeSync(2, "Exiting normally, received signal 2.\\n" + "x".repeat(65 << 20));`;
-    const err = failWith(`${flood} process.exit(255);`) as { code?: string; cancelled?: boolean };
+    const err = (await failWith(`${flood} process.exit(255);`)) as {
+      code?: string;
+      cancelled?: boolean;
+    };
     expect(err.code).toBe("ENOBUFS");
     expect(err.cancelled).toBeUndefined();
   });
