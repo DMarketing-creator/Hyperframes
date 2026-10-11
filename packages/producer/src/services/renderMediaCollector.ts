@@ -9,15 +9,25 @@
  * into a single entry. See mediaRenderIds.ts for the full failure.
  *
  * Reading the inlined document instead makes the render document the single
- * source of truth for what media exists: every element is present exactly once,
- * `assignMediaRenderIds` has already given it a document-unique key, and the
- * timeline offsets are recoverable from the composition hosts it sits inside.
+ * source of truth: every element is present exactly once, keyed by its render id
+ * (stamped when files are inlined) or else its author id, and placed by the
+ * composition hosts it sits inside.
  */
 
 import { parseHTML } from "linkedom";
-import { MEDIA_RENDER_ID_ATTR, resolveAuthoredTimingWindow } from "@hyperframes/core";
+import {
+  MEDIA_RENDER_ID_ATTR,
+  normalizeRateSpec,
+  resolveAuthoredTimingWindow,
+  shiftRateLane,
+  sourceTimeAt,
+} from "@hyperframes/core";
 import {
   MEDIA_START_BASIS_ATTR,
+  compositionOriginSeconds,
+  cutToHostSlots,
+  hostInPointSeconds,
+  type HostSlot,
   readMediaStartBasis,
   resolveAbsoluteMediaStartSeconds,
   type MediaStartBasis,
@@ -33,13 +43,6 @@ import {
   type ImageElement,
   type AudioElement,
 } from "@hyperframes/engine";
-
-/**
- * Marks a host element that `inlineSubCompositions` hoisted a composition into.
- * Set unconditionally on every inlined host, which makes it the reliable signal
- * for "this ancestor shifts its children along the timeline".
- */
-const COMPOSITION_HOST_ATTR = "data-composition-file";
 
 /**
  * Where a composition host closes in its parent's time, or null when unbounded.
@@ -62,9 +65,26 @@ interface HostWindow {
   limit: number;
   /** Whether authored media time is composition-local or legacy root-global. */
   basis: MediaStartBasis;
+  /** Root-time slots of the enclosing hosts with an in-point. */
+  slots: HostSlot[];
 }
 
-const ROOT_WINDOW: HostWindow = { offset: 0, limit: Infinity, basis: "local" };
+const ROOT_WINDOW: HostWindow = { offset: 0, limit: Infinity, basis: "local", slots: [] };
+
+// Every composition host shifts what it holds, inline or inlined from a file, as in core's start resolver.
+const COMPOSITION_HOST_SELECTOR =
+  "[data-composition-id], [data-composition-src], [data-composition-file]";
+
+/** Composition hosts that place `element`, root first. */
+function enclosingHosts(element: Element): Element[] {
+  const hosts: Element[] = [];
+  for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
+    if (ancestor.matches(COMPOSITION_HOST_SELECTOR)) {
+      hosts.unshift(ancestor);
+    }
+  }
+  return hosts;
+}
 
 /**
  * Fold a media element's chain of composition hosts into one window.
@@ -82,48 +102,53 @@ function resolveHostWindow(
   startCache: Map<RefResolverEl, number>,
   visiting: Set<RefResolverEl>,
 ): HostWindow {
-  const hosts: Element[] = [];
-  for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
-    if (ancestor.hasAttribute(COMPOSITION_HOST_ATTR)) hosts.push(ancestor);
-  }
+  const hosts = enclosingHosts(element);
   if (hosts.length === 0) return ROOT_WINDOW;
 
   let offset = 0;
   let limit = Infinity;
-  // parentElement walks leaf → root; the offsets accumulate root → leaf.
-  for (const host of hosts.reverse()) {
+  const slots: HostSlot[] = [];
+  for (const [index, host] of hosts.entries()) {
     const hostStart = resolveReferencedStart(document, host, startCache, visiting);
     const hostEnd = resolveHostEnd(host, hostStart);
-    if (hostEnd != null) limit = Math.min(limit, offset + hostEnd);
-    offset += hostStart;
+    if (hostEnd != null && !isRootComposition(host, index)) {
+      limit = Math.min(limit, offset + hostEnd);
+    }
+    if (hostInPointSeconds(host) > 0) {
+      slots.push({ start: offset + hostStart, end: offset + (hostEnd ?? Infinity) });
+    }
+    offset += compositionOriginSeconds(hostStart, host);
   }
+  return { offset, limit, basis: mediaStartBasis(element), slots };
+}
+
+// The root composition's end is the render's length, not a cut: a cut would move clip fade-outs.
+const isRootComposition = (host: Element, depth: number): boolean =>
+  depth === 0 && !host.matches("[data-composition-src], [data-composition-file]");
+
+function mediaStartBasis(element: Element): MediaStartBasis {
   const tag = element.tagName.toLowerCase();
-  const basis =
-    tag === "video" || tag === "audio"
-      ? readMediaStartBasis(element.getAttribute(MEDIA_START_BASIS_ATTR))
-      : "local";
-  return {
-    offset,
-    limit,
-    basis,
-  };
+  return tag === "video" || tag === "audio"
+    ? readMediaStartBasis(element.getAttribute(MEDIA_START_BASIS_ATTR))
+    : "local";
 }
 
 /**
- * Map each render id to the window of the composition hosts it is nested in.
- * Keyed on the render id rather than document position so the caller never has
- * to assume two separate parses walk the document in the same order.
+ * Map each media id the parsers report (render id, else author id: render ids are only stamped
+ * when files are inlined) to its hosts' window, keyed on id so two parses need not walk in step.
  */
 function collectHostWindows(html: string): Map<string, HostWindow> {
   const { document } = parseHTML(html);
   const windows = new Map<string, HostWindow>();
   const startCache = new Map<RefResolverEl, number>();
   const visiting = new Set<RefResolverEl>();
-  for (const element of document.querySelectorAll(`[${MEDIA_RENDER_ID_ATTR}]`)) {
+  // What the parsers report; an author id never displaces a render id, or another author id.
+  for (const element of document.querySelectorAll("video, audio, img[src]")) {
     const renderId = element.getAttribute(MEDIA_RENDER_ID_ATTR);
-    if (!renderId) continue;
+    const id = renderId || element.getAttribute("id");
+    if (!id || (!renderId && windows.has(id))) continue;
     windows.set(
-      renderId,
+      id,
       resolveHostWindow(element as unknown as Element, document, startCache, visiting),
     );
   }
@@ -131,15 +156,15 @@ function collectHostWindows(html: string): Map<string, HostWindow> {
 }
 
 /**
- * Shift a scene-relative window onto the root timeline.
- * Returns null when the clip starts after its host has already ended, matching
- * the `start < absoluteEnd` drop the file-tree walk applied.
+ * Shift a scene-relative window onto the root timeline; null when the clip starts after its host
+ * ends (the file-tree walk's `start < absoluteEnd` drop) or its in-point hosts cut all of it.
+ * `start` stays the clip's origin; `played` is the part the in-point hosts' slots keep.
  */
 function toAbsoluteWindow(
   start: number,
   end: number,
   window: HostWindow,
-): { start: number; end: number } | null {
+): { start: number; end: number; played: { start: number; end: number } } | null {
   const absoluteStart = resolveAbsoluteMediaStartSeconds({
     authoredStart: start,
     hostStart: window.offset,
@@ -151,7 +176,29 @@ function toAbsoluteWindow(
     hostStart: window.offset,
     basis: window.basis,
   });
-  return { start: absoluteStart, end: Math.min(absoluteEnd, window.limit) };
+  const absolute = { start: absoluteStart, end: Math.min(absoluteEnd, window.limit) };
+  const played = cutToHostSlots(absolute, window.slots);
+  if (played.end === played.start && absolute.end > absolute.start) return null;
+  return { start: absolute.start, end: played.end, played };
+}
+
+/** Start a clip where its in-point hosts let it play, that much further into its source. */
+function startAtPlayed<T extends AudioElement | VideoElement>(
+  clip: T,
+  played: { start: number },
+): T {
+  const head = played.start - clip.start;
+  if (head <= 0) return clip;
+  // ponytail: a loop runs from mediaStart, so it only moves to its slot and keeps main's phase error;
+  // an exact cut needs a visible start separate from the loop origin in the engine.
+  if ("loop" in clip && clip.loop) return { ...clip, start: played.start };
+  const rate = normalizeRateSpec(clip.playbackRate);
+  return {
+    ...clip,
+    start: played.start,
+    mediaStart: clip.mediaStart + sourceTimeAt(rate, head),
+    playbackRate: shiftRateLane(rate, head),
+  };
 }
 
 export interface RenderMedia {
@@ -175,13 +222,17 @@ export function collectRenderMedia(html: string): RenderMedia {
   const videos: VideoElement[] = [];
   for (const video of parseVideoElements(html)) {
     const absolute = toAbsoluteWindow(video.start, video.end, windowFor(video.id));
-    if (absolute) videos.push({ ...video, ...absolute });
+    if (absolute) {
+      videos.push(
+        startAtPlayed({ ...video, start: absolute.start, end: absolute.end }, absolute.played),
+      );
+    }
   }
 
   const images: ImageElement[] = [];
   for (const image of parseImageElements(html)) {
     const absolute = toAbsoluteWindow(image.start, image.end, windowFor(image.id));
-    if (absolute) images.push({ ...image, ...absolute });
+    if (absolute) images.push({ ...image, start: absolute.start, end: absolute.end });
   }
 
   // A <video data-has-audio> track is reported as "<renderId>-audio"; strip the
@@ -194,11 +245,12 @@ export function collectRenderMedia(html: string): RenderMedia {
     const authoredEnd = audio.end > 0 ? audio.end : Infinity;
     const absolute = toAbsoluteWindow(audio.start, authoredEnd, windowFor(elementId));
     if (!absolute) continue;
-    audios.push({
-      ...audio,
-      start: absolute.start,
-      end: Number.isFinite(absolute.end) ? absolute.end : 0,
-    });
+    audios.push(
+      startAtPlayed(
+        { ...audio, start: absolute.start, end: Number.isFinite(absolute.end) ? absolute.end : 0 },
+        absolute.played,
+      ),
+    );
   }
 
   return { videos, audios, images };
