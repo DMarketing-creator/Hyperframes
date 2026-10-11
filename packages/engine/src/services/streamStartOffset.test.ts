@@ -1,15 +1,16 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { getFfmpegBinary } from "../utils/ffmpegBinaries.js";
+import { FFPROBE_PATH_ENV, getFfmpegBinary, getFfprobeBinary } from "../utils/ffmpegBinaries.js";
 import { processCompositionAudio } from "./audioMixer.js";
-import { extractMediaMetadata } from "../utils/ffprobe.js";
+import { extractAudioMetadata, extractMediaMetadata } from "../utils/ffprobe.js";
 import {
   extractVideoFramesRange,
   getFrameAtTime,
   resolveFinalFrameExtractionWindow,
+  resolvePlayableVideoDuration,
   resolveVideoExtractionWindow,
 } from "./videoFrameExtractor.js";
 
@@ -86,11 +87,49 @@ describe.skipIf(!HAS_FFMPEG)(
       const lead = String(LEAD_SECONDS);
       const picture = join(dir, "picture.mp4");
       const steps = join(dir, "steps.m4a");
-      const mux = ["-map", "0:v", "-map", "1:a", "-c", "copy"];
+      const maps = ["-map", "0:v", "-map", "1:a"];
+      const mux = [...maps, "-c", "copy"];
       ffmpeg(["-itsoffset", lead, "-i", picture, "-i", steps, ...mux, join(dir, "video-late.mp4")]);
       ffmpeg(["-i", picture, "-itsoffset", lead, "-i", steps, ...mux, join(dir, "audio-late.mp4")]);
+      ffmpeg(["-i", picture, "-i", steps, ...mux, join(dir, "aligned.mp4")]);
+      const steps45 = join(dir, "steps45.m4a");
+      ffmpeg([
+        "-f",
+        "lavfi",
+        "-i",
+        `aevalsrc='0.1*sin(2*PI*(200+100*floor(t))*t)':s=${SAMPLE_RATE}:d=45`,
+        steps45,
+      ]);
+      ffmpeg([
+        "-itsoffset",
+        "20",
+        "-i",
+        picture,
+        "-i",
+        steps45,
+        ...mux,
+        join(dir, "video-late-20.mp4"),
+      ]);
+      const remux = (from: string, to: string) =>
+        ffmpeg(["-i", join(dir, from), "-c", "copy", join(dir, to)]);
       // MPEG-TS starts its clock at 1.4 s, so no stream starts at 0.
-      ffmpeg(["-i", join(dir, "video-late.mp4"), "-c", "copy", join(dir, "video-late.ts")]);
+      remux("video-late.mp4", "video-late.ts");
+      // A lead past ffprobe's probe window makes it give the late stream the container's timing.
+      remux("video-late.mp4", "video-late.mkv");
+      remux("audio-late.mp4", "audio-late.mkv");
+      remux("video-late-20.mp4", "video-late-20.ts");
+      remux("video-late-20.mp4", "video-late-20.nut");
+      // FLV gives a late video a start but no duration.
+      remux("video-late.mp4", "video-late.flv");
+      const webm = (videoOffset: string, audioOffset: string, to: string) =>
+        ffmpeg([
+          ...["-itsoffset", videoOffset, "-i", picture, "-itsoffset", audioOffset, "-i", steps],
+          ...[...maps, "-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "8"],
+          ...["-c:a", "libopus", join(dir, to)],
+        ]);
+      webm(lead, "0", "video-late.webm");
+      webm("0", lead, "audio-late.webm");
+      webm("0", "0", "aligned.webm");
     }, 60_000);
 
     afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -107,6 +146,13 @@ describe.skipIf(!HAS_FFMPEG)(
       { source: "video-late.mp4", audioLead: 0, type: "video", mediaStart: 3 },
       { source: "video-late.mp4", audioLead: 0, type: "audio", mediaStart: 0 },
       { source: "video-late.ts", audioLead: 0, type: "video", mediaStart: 0 },
+      { source: "video-late.webm", audioLead: 0, type: "video", mediaStart: 0 },
+      { source: "video-late.mkv", audioLead: 0, type: "video", mediaStart: 0 },
+      { source: "video-late-20.ts", audioLead: 0, type: "video", mediaStart: 0 },
+      { source: "video-late-20.nut", audioLead: 0, type: "video", mediaStart: 0 },
+      { source: "aligned.webm", audioLead: 0, type: "video", mediaStart: 0 },
+      { source: "audio-late.webm", audioLead: LEAD_SECONDS, type: "video", mediaStart: 0 },
+      { source: "audio-late.mkv", audioLead: LEAD_SECONDS, type: "video", mediaStart: 0 },
       { source: "video-late.mp4", audioLead: 0, type: "video", mediaStart: 3, rate: flatLane },
       { source: "audio-late.mp4", audioLead: LEAD_SECONDS, type: "video", mediaStart: 0 },
       { source: "audio-late.mp4", audioLead: LEAD_SECONDS, type: "video", mediaStart: 3 },
@@ -242,5 +288,78 @@ describe.skipIf(!HAS_FFMPEG)(
       );
       expect(window.extractionMediaStart).toBeGreaterThan(LEAD_SECONDS + PICTURE_SECONDS - 0.1);
     }, 30_000);
+
+    it.each(["video-late.webm", "video-late.mkv", "video-late.flv"])(
+      "%s: hides the late video's lead and ends it where the stream ends",
+      async (name) => {
+        const source = join(dir, name);
+        expect(resolvePlayableVideoDuration(await extractMediaMetadata(source))).toBeCloseTo(
+          LEAD_SECONDS + PICTURE_SECONDS,
+          0,
+        );
+        const extracted = await extractVideoFramesRange(source, name, 0, CLIP_SECONDS, {
+          fps: 10,
+          outputDir: join(dir, "frames"),
+        });
+        expect(getFrameAtTime(extracted, 1, 0)).toBeNull();
+        expect(getFrameAtTime(extracted, LEAD_SECONDS - 0.5, 0)).not.toBeNull();
+      },
+      60_000,
+    );
+
+    it.each(["video-late-20.ts", "video-late-20.nut"])(
+      "%s: finds a 20 s video lead that ffprobe reports as the container's start",
+      async (name) => {
+        const metadata = await extractMediaMetadata(join(dir, name));
+        expect(metadata.videoStreamLeadSeconds).toBeCloseTo(20, 1);
+        expect(resolvePlayableVideoDuration(metadata)).toBeCloseTo(20 + PICTURE_SECONDS, 0);
+      },
+    );
+
+    it("hides a 20 s video lead in NUT and shows the video after it", async () => {
+      const source = join(dir, "video-late-20.nut");
+      const extracted = await extractVideoFramesRange(source, "video-late-20-nut", 0, 22, {
+        fps: 10,
+        outputDir: join(dir, "frames"),
+      });
+      expect(getFrameAtTime(extracted, 1, 0)).toBeNull();
+      expect(getFrameAtTime(extracted, 19.5, 0)).not.toBeNull();
+    }, 60_000);
+
+    it("keeps an aligned MP4's timing exactly as ffprobe reports it", async () => {
+      const source = join(dir, "aligned.mp4");
+      const video = await extractMediaMetadata(source);
+      expect(video.videoStreamLeadSeconds).toBe(0);
+      expect(video.videoStreamDurationSeconds).toBe(PICTURE_SECONDS);
+      expect((await extractAudioMetadata(source)).latestStreamLeadSeconds).toBe(0);
+    });
+
+    it.skipIf(process.platform === "win32")(
+      "does not cache the timing of a probe whose packet read failed",
+      async () => {
+        const marker = join(dir, "failed-once");
+        const fake = join(dir, "ffprobe-fails-once");
+        const real = getFfprobeBinary();
+        writeFileSync(
+          fake,
+          `#!/bin/sh\ncase "$*" in *"%+#1"*) [ -e "${marker}" ] || { : > "${marker}"; exit 1; } ;; esac\nexec "${real}" "$@"\n`,
+          { mode: 0o755 },
+        );
+        const source = join(dir, "video-late-uncached.webm");
+        copyFileSync(join(dir, "video-late.webm"), source);
+        const previous = process.env[FFPROBE_PATH_ENV];
+        process.env[FFPROBE_PATH_ENV] = fake;
+        try {
+          expect((await extractMediaMetadata(source)).videoStreamLeadSeconds).toBe(0);
+          expect((await extractMediaMetadata(source)).videoStreamLeadSeconds).toBeCloseTo(
+            LEAD_SECONDS,
+            1,
+          );
+        } finally {
+          if (previous === undefined) delete process.env[FFPROBE_PATH_ENV];
+          else process.env[FFPROBE_PATH_ENV] = previous;
+        }
+      },
+    );
   },
 );
